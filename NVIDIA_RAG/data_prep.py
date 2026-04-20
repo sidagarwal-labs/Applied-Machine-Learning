@@ -11,7 +11,7 @@ def extract_all_chunks(dataset_split):
     for doc_idx, record in enumerate(tqdm(dataset_split, desc="Extracting chunks")):
         for chunk in record['chunks']:
             all_chunks.append({
-                'chunk_id': chunk['chunk_id'],
+                'chunk_id': f"{doc_idx}_{chunk['chunk_id']}",
                 'chunk_text': chunk['text'],
                 'doc_idx': doc_idx,
                 'word_count': chunk['word_count'],
@@ -32,7 +32,7 @@ def extract_qa_pairs(dataset_split):
                 'reasoning_type': qa['reasoning_type'],
                 'question_complexity': qa['question_complexity'],
                 'hop_count': qa['hop_count'],
-                'segment_ids': qa['segment_ids'],
+                'segment_ids': [f"{doc_idx}_{sid}" for sid in qa['segment_ids']],
                 'doc_idx': doc_idx,
             })
     return all_qa
@@ -68,10 +68,13 @@ def create_relevance_triples(qa_pairs, all_chunks, neg_per_positive=4, seed=42):
                 'doc_idx': qa['doc_idx'],
             })
 
-        #negative triples
-        neg_pool = [cid for cid in all_chunk_ids if cid not in relevant_ids]
-        n_neg = min(len(relevant_ids) * neg_per_positive, len(neg_pool))
-        neg_samples = random.sample(neg_pool, n_neg)
+        #negative triples (sample directly, resample on rare collision)
+        n_neg = len(relevant_ids) * neg_per_positive
+        neg_samples = set()
+        while len(neg_samples) < n_neg:
+            cid = random.choice(all_chunk_ids)
+            if cid not in relevant_ids:
+                neg_samples.add(cid)
 
         for chunk_id in neg_samples:
             chunk = chunk_lookup[chunk_id]
