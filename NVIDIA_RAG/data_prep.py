@@ -5,25 +5,27 @@ import pandas as pd
 from tqdm import tqdm
 
 
-def extract_all_chunks(dataset_split):
+def extract_all_chunks(dataset_split, doc_offset=0):
     """Extract all chunks into a flat list of dicts."""
     all_chunks = []
     for doc_idx, record in enumerate(tqdm(dataset_split, desc="Extracting chunks")):
+        global_idx = doc_offset + doc_idx
         for chunk in record['chunks']:
             all_chunks.append({
-                'chunk_id': f"{doc_idx}_{chunk['chunk_id']}",
+                'chunk_id': f"{global_idx}_{chunk['chunk_id']}",
                 'chunk_text': chunk['text'],
-                'doc_idx': doc_idx,
+                'doc_idx': global_idx,
                 'word_count': chunk['word_count'],
                 'sentence_count': chunk['sentence_count'],
             })
     return all_chunks
 
 
-def extract_qa_pairs(dataset_split):
+def extract_qa_pairs(dataset_split, doc_offset=0):
     """Extract all QA pairs with relevant segment_ids."""
     all_qa = []
     for doc_idx, record in enumerate(tqdm(dataset_split, desc="Extracting QA pairs")):
+        global_idx = doc_offset + doc_idx
         for qa in record['deduplicated_qa_pairs']:
             all_qa.append({
                 'question': qa['question'],
@@ -32,8 +34,8 @@ def extract_qa_pairs(dataset_split):
                 'reasoning_type': qa['reasoning_type'],
                 'question_complexity': qa['question_complexity'],
                 'hop_count': qa['hop_count'],
-                'segment_ids': [f"{doc_idx}_{sid}" for sid in qa['segment_ids']],
-                'doc_idx': doc_idx,
+                'segment_ids': [f"{global_idx}_{sid}" for sid in qa['segment_ids']],
+                'doc_idx': global_idx,
             })
     return all_qa
 
