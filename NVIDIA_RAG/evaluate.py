@@ -176,19 +176,35 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
     return precomputed
 
 
-def evaluate_from_candidates(precomputed, model, k_values=[5, 10, 20]):
+def evaluate_from_candidates(precomputed, model, k_values=[5, 10, 20], show_progress=True):
     """Score precomputed candidates with a model and compute metrics.
 
     model=None -> BM25 baseline, model='tfidf' -> TF-IDF baseline,
     otherwise uses model.predict_proba or model.predict.
     """
+    from tqdm.auto import tqdm
+
     results = {f'NDCG@{k}': [] for k in k_values}
     results.update({f'Recall@{k}': [] for k in k_values})
     results['MRR'] = []
     results['MAP'] = []
     meta_rows = []
 
-    for entry in precomputed:
+    iterator = tqdm(precomputed, desc="Evaluating", disable=not show_progress)
+
+    #batch model predictions across all questions for speed
+    batched_scores = None
+    if model is not None and model != 'tfidf':
+        sizes = [len(e['candidate_ids']) for e in precomputed]
+        all_features = np.vstack([e['features'] for e in precomputed])
+        if hasattr(model, 'predict_proba'):
+            all_scores = model.predict_proba(all_features)[:, 1]
+        else:
+            all_scores = model.predict(all_features)
+        offsets = np.cumsum([0] + sizes)
+        batched_scores = [all_scores[offsets[i]:offsets[i + 1]] for i in range(len(sizes))]
+
+    for i, entry in enumerate(iterator):
         candidates = entry['candidate_ids']
         golden_ids = entry['golden_ids']
 
@@ -196,10 +212,9 @@ def evaluate_from_candidates(precomputed, model, k_values=[5, 10, 20]):
             scores = entry['bm25_scores']
         elif model == 'tfidf':
             scores = entry['tfidf_scores']
-        elif hasattr(model, 'predict_proba'):
-            scores = model.predict_proba(entry['features'])[:, 1]
         else:
-            scores = model.predict(entry['features'])
+            assert batched_scores is not None
+            scores = batched_scores[i]
 
         ranked_idx = np.argsort(-scores)
         relevances = [1 if candidates[i] in golden_ids else 0 for i in ranked_idx]
