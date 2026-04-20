@@ -99,6 +99,12 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
     print(f"  Batch TF-IDF scoring {len(unique_questions)} unique questions...")
     tfidf_q_vecs = tfidf_index.vectorizer.transform(unique_questions)
 
+    #batch-compute ALL score matrices at once (sparse × sparse, very fast)
+    print("  Computing BM25 score matrix (batch)...")
+    bm25_score_matrix = bm25_q_idf.dot(bm25_index.adjusted_tf.T).tocsr()
+    print("  Computing TF-IDF score matrix (batch)...")
+    tfidf_score_matrix = (tfidf_q_vecs @ tfidf_index.tfidf_matrix.T).tocsr()
+
     #precompute chunk_id -> index for fast lookup
     bm25_id_to_idx = bm25_index.chunk_id_to_idx
     tfidf_id_to_idx = tfidf_index.chunk_id_to_idx
@@ -109,9 +115,9 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
         golden_ids = set(qa['segment_ids'])
         qi = q_to_idx[question]
 
-        #compute full-corpus scores via sparse dot product (one per index)
-        bm25_all = bm25_q_idf[qi].dot(bm25_index.adjusted_tf.T).toarray().flatten()
-        tfidf_all = cosine_similarity(tfidf_q_vecs[qi], tfidf_index.tfidf_matrix).flatten()
+        #look up pre-computed score rows (no per-question matrix ops)
+        bm25_all = bm25_score_matrix[qi].toarray().flatten()
+        tfidf_all = tfidf_score_matrix[qi].toarray().flatten()
 
         #top-k from each
         bm25_topk = np.argsort(bm25_all)[-candidate_k:][::-1]
