@@ -1,15 +1,8 @@
-"""
-evaluate.py - Ranking evaluation metrics.
-
-Implements standard IR metrics:
-  - NDCG@k (Normalized Discounted Cumulative Gain)
-  - Recall@k
-  - MRR (Mean Reciprocal Rank)
-  - MAP (Mean Average Precision)
-"""
+"""evaluate.py - Ranking evaluation metrics (NDCG, Recall, MRR, MAP)."""
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 def dcg_at_k(relevances, k):
@@ -17,18 +10,13 @@ def dcg_at_k(relevances, k):
     relevances = np.array(relevances[:k])
     if len(relevances) == 0:
         return 0.0
-    # DCG = sum(rel_i / log2(i+2)) for i in 0..k-1
     discounts = np.log2(np.arange(len(relevances)) + 2)
     return np.sum(relevances / discounts)
 
 
 def ndcg_at_k(relevances, k):
-    """
-    Compute NDCG@k.
-    relevances: list of relevance scores sorted by model's predicted rank.
-    """
+    """Compute NDCG@k."""
     dcg = dcg_at_k(relevances, k)
-    # Ideal DCG: sort relevances descending
     ideal_relevances = sorted(relevances, reverse=True)
     idcg = dcg_at_k(ideal_relevances, k)
     if idcg == 0:
@@ -37,21 +25,14 @@ def ndcg_at_k(relevances, k):
 
 
 def recall_at_k(relevances, k, total_relevant):
-    """
-    Compute Recall@k.
-    relevances: list of binary relevance scores sorted by predicted rank.
-    total_relevant: total number of relevant documents for this query.
-    """
+    """Compute Recall@k."""
     if total_relevant == 0:
         return 0.0
     return sum(relevances[:k]) / total_relevant
 
 
 def reciprocal_rank(relevances):
-    """
-    Compute Reciprocal Rank.
-    Returns 1/rank of the first relevant document.
-    """
+    """Compute Reciprocal Rank."""
     for i, rel in enumerate(relevances):
         if rel > 0:
             return 1.0 / (i + 1)
@@ -59,9 +40,7 @@ def reciprocal_rank(relevances):
 
 
 def average_precision(relevances):
-    """
-    Compute Average Precision for a single query.
-    """
+    """Compute Average Precision."""
     if sum(relevances) == 0:
         return 0.0
     precisions = []
@@ -74,24 +53,13 @@ def average_precision(relevances):
 
 
 def evaluate_ranking(df, score_col, k_values=[5, 10, 20]):
-    """
-    Evaluate a ranking model on a DataFrame.
-
-    Args:
-        df: DataFrame with columns: question, chunk_id, relevance, and score_col
-        score_col: name of the column containing predicted scores
-        k_values: list of k values for @k metrics
-
-    Returns:
-        dict of metric_name -> value
-    """
+    """Evaluate ranking model, returns dict of metric_name -> value."""
     results = {f'NDCG@{k}': [] for k in k_values}
     results.update({f'Recall@{k}': [] for k in k_values})
     results['MRR'] = []
     results['MAP'] = []
 
     for question, group in df.groupby('question'):
-        # Sort by predicted score (descending)
         sorted_group = group.sort_values(score_col, ascending=False)
         relevances = sorted_group['relevance'].tolist()
         total_relevant = sum(relevances)
@@ -103,8 +71,152 @@ def evaluate_ranking(df, score_col, k_values=[5, 10, 20]):
         results['MRR'].append(reciprocal_rank(relevances))
         results['MAP'].append(average_precision(relevances))
 
-    # Average across all queries
     return {metric: np.mean(values) for metric, values in results.items()}
+
+
+def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
+                       feature_cols, candidate_k=100):
+    """Retrieve candidates and compute features once per question.
+
+    Returns a list of dicts, one per question, each containing:
+        - candidate_ids: list of chunk IDs
+        - features: np.ndarray of shape (n_candidates, n_features)
+        - golden_ids: set of relevant chunk IDs
+        - metadata: dict with query_type, reasoning_type, counts
+    """
+    from features import compute_text_overlap
+    from tqdm import tqdm
+
+    #batch-encode all unique questions at once
+    questions = [qa['question'] for qa in qa_list]
+    unique_questions = list(dict.fromkeys(questions))
+    q_to_idx = {q: i for i, q in enumerate(unique_questions)}
+
+    print(f"  Batch BM25 scoring {len(unique_questions)} unique questions...")
+    bm25_q_vecs = bm25_index.vectorizer.transform(unique_questions)
+    bm25_q_idf = bm25_q_vecs.multiply(bm25_index.idf).tocsr()
+
+    print(f"  Batch TF-IDF scoring {len(unique_questions)} unique questions...")
+    tfidf_q_vecs = tfidf_index.vectorizer.transform(unique_questions)
+
+    #precompute chunk_id -> index for fast lookup
+    bm25_id_to_idx = bm25_index.chunk_id_to_idx
+    tfidf_id_to_idx = tfidf_index.chunk_id_to_idx
+
+    precomputed = []
+    for qa in tqdm(qa_list, desc="Preparing candidates"):
+        question = qa['question']
+        golden_ids = set(qa['segment_ids'])
+        qi = q_to_idx[question]
+
+        #compute full-corpus scores via sparse dot product (one per index)
+        bm25_all = bm25_q_idf[qi].dot(bm25_index.adjusted_tf.T).toarray().flatten()
+        tfidf_all = cosine_similarity(tfidf_q_vecs[qi], tfidf_index.tfidf_matrix).flatten()
+
+        #top-k from each
+        bm25_topk = np.argsort(bm25_all)[-candidate_k:][::-1]
+        tfidf_topk = np.argsort(tfidf_all)[-candidate_k:][::-1]
+
+        seen = set()
+        candidates = []
+        for idx in list(bm25_topk) + list(tfidf_topk):
+            cid = bm25_index.chunk_ids[idx]
+            if cid not in seen:
+                seen.add(cid)
+                candidates.append(cid)
+
+        #build feature rows using already-computed scores
+        q_tokens = set(question.lower().split())
+        q_len = len(question.split())
+        rows = []
+        for chunk_id in candidates:
+            chunk = chunk_lookup[chunk_id]
+            c_tokens = set(chunk['chunk_text'].lower().split())
+            overlap_count = len(q_tokens & c_tokens)
+
+            rows.append({
+                'bm25_score': float(bm25_all[bm25_id_to_idx[chunk_id]]),
+                'cosine_similarity': float(tfidf_all[tfidf_id_to_idx[chunk_id]]),
+                'token_overlap_ratio': overlap_count / len(q_tokens) if q_tokens else 0.0,
+                'token_overlap_count': overlap_count,
+                'question_length': q_len,
+                'chunk_word_count': chunk['word_count'],
+                'chunk_sentence_count': chunk['sentence_count'],
+                'question_complexity': qa['question_complexity'],
+                'hop_count': qa['hop_count'],
+            })
+
+        feat_df = pd.DataFrame(rows)
+        for col in feature_cols:
+            if col not in feat_df.columns:
+                feat_df[col] = 0
+
+        precomputed.append({
+            'candidate_ids': candidates,
+            'features': feat_df[feature_cols].values,
+            'bm25_scores': feat_df['bm25_score'].values,
+            'tfidf_scores': feat_df['cosine_similarity'].values,
+            'golden_ids': golden_ids,
+            'metadata': {
+                'question': question,
+                'query_type': qa['query_type'],
+                'reasoning_type': qa['reasoning_type'],
+                'n_candidates': len(candidates),
+                'n_golden': len(golden_ids),
+                'golden_in_candidates': len(golden_ids & seen),
+            },
+        })
+
+    return precomputed
+
+
+def evaluate_from_candidates(precomputed, model, k_values=[5, 10, 20]):
+    """Score precomputed candidates with a model and compute metrics.
+
+    model=None -> BM25 baseline, model='tfidf' -> TF-IDF baseline,
+    otherwise uses model.predict_proba or model.predict.
+    """
+    results = {f'NDCG@{k}': [] for k in k_values}
+    results.update({f'Recall@{k}': [] for k in k_values})
+    results['MRR'] = []
+    results['MAP'] = []
+    meta_rows = []
+
+    for entry in precomputed:
+        candidates = entry['candidate_ids']
+        golden_ids = entry['golden_ids']
+
+        if model is None:
+            scores = entry['bm25_scores']
+        elif model == 'tfidf':
+            scores = entry['tfidf_scores']
+        elif hasattr(model, 'predict_proba'):
+            scores = model.predict_proba(entry['features'])[:, 1]
+        else:
+            scores = model.predict(entry['features'])
+
+        ranked_idx = np.argsort(-scores)
+        relevances = [1 if candidates[i] in golden_ids else 0 for i in ranked_idx]
+        total_relevant = len(golden_ids)
+
+        for k in k_values:
+            results[f'NDCG@{k}'].append(ndcg_at_k(relevances, k))
+            results[f'Recall@{k}'].append(recall_at_k(relevances, k, total_relevant))
+        results['MRR'].append(reciprocal_rank(relevances))
+        results['MAP'].append(average_precision(relevances))
+        meta_rows.append(entry['metadata'])
+
+    metrics = {m: np.mean(v) for m, v in results.items()}
+    return metrics, pd.DataFrame(meta_rows)
+
+
+def evaluate_full_retrieval(test_qa, bm25_index, tfidf_index, chunk_lookup,
+                            model, feature_cols, candidate_k=100,
+                            k_values=[5, 10, 20]):
+    """Evaluate against full corpus (convenience wrapper, not for multi-model use)."""
+    precomputed = prepare_candidates(test_qa, bm25_index, tfidf_index,
+                                     chunk_lookup, feature_cols, candidate_k)
+    return evaluate_from_candidates(precomputed, model, k_values)
 
 
 def print_evaluation(metrics, model_name="Model"):
