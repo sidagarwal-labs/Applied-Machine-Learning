@@ -1,4 +1,4 @@
-"""features.py - Compute features for (question, chunk) pairs."""
+"""Feature computation for (question, chunk) pairs."""
 
 import numpy as np
 import pandas as pd
@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 
 def compute_text_overlap(question, chunk_text):
-    """Compute text overlap features between question and chunk."""
+    """Token overlap ratio and count between question and chunk."""
     q_tokens = set(question.lower().split())
     c_tokens = set(chunk_text.lower().split())
 
@@ -21,7 +21,7 @@ def compute_text_overlap(question, chunk_text):
 
 
 def compute_features(triples_df, bm25_index, tfidf_index):
-    """Compute feature matrix for all (question, chunk) pairs."""
+    """Compute full feature matrix for all (question, chunk) pairs in triples_df."""
     import scipy.sparse as sp
     from sklearn.preprocessing import normalize
 
@@ -53,7 +53,7 @@ def compute_features(triples_df, bm25_index, tfidf_index):
     cosine_sims = np.array(q_rows_tfidf.multiply(c_rows_tfidf).sum(axis=1)).flatten()
     print(f"  TF-IDF scores computed: {cosine_sims.shape}")
 
-    #text overlap features
+    #text overlap
     print("Computing text overlap features...")
     overlap_ratios = np.zeros(n_pairs)
     overlap_counts = np.zeros(n_pairs, dtype=int)
@@ -73,7 +73,7 @@ def compute_features(triples_df, bm25_index, tfidf_index):
         'question_length': q_lengths,
     })
 
-    #one-hot encode query_type and reasoning_type
+    #one-hot encode categorical columns
     query_type_dummies = pd.get_dummies(triples_df['query_type'], prefix='qtype')
     reasoning_type_dummies = pd.get_dummies(triples_df['reasoning_type'], prefix='rtype')
 
@@ -88,9 +88,9 @@ def compute_features(triples_df, bm25_index, tfidf_index):
 
 
 def get_feature_columns(df):
-    """Return feature column names, excluding metadata/target columns."""
+    """Return feature column names (excludes metadata/target columns)."""
     exclude = {
         'question', 'chunk_id', 'chunk_text', 'relevance',
-        'query_type', 'reasoning_type', 'doc_idx', 'segment_ids'
+        'query_type', 'reasoning_type', 'doc_id', 'chunk_ids', 'original_chunk_id'
     }
     return [c for c in df.columns if c not in exclude]

@@ -1,4 +1,4 @@
-"""evaluate.py - Ranking evaluation metrics (NDCG, Recall, MRR, MAP)."""
+"""Ranking evaluation metrics and candidate preparation."""
 
 import numpy as np
 import pandas as pd
@@ -75,63 +75,80 @@ def evaluate_ranking(df, score_col, k_values=[5, 10, 20]):
 
 
 def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
-                       feature_cols, candidate_k=100):
-    """Retrieve candidates and compute features once per question.
+                       feature_cols, candidate_k=100, batch_size=500):
+    """Retrieve BM25∪TF-IDF top-k candidates and compute features per question.
 
-    Returns a list of dicts, one per question, each containing:
-        - candidate_ids: list of chunk IDs
-        - features: np.ndarray of shape (n_candidates, n_features)
-        - golden_ids: set of relevant chunk IDs
-        - metadata: dict with query_type, reasoning_type, counts
+    Returns list of dicts with candidate_ids, features, golden_ids, metadata.
+    Uses dense×sparse batched matmul to avoid scipy OOM and per-question overhead.
     """
-    from features import compute_text_overlap
     from tqdm import tqdm
+    import gc
 
-    #batch-encode all unique questions at once
     questions = [qa['question'] for qa in qa_list]
     unique_questions = list(dict.fromkeys(questions))
     q_to_idx = {q: i for i, q in enumerate(unique_questions)}
+    n_unique = len(unique_questions)
 
-    print(f"  Batch BM25 scoring {len(unique_questions)} unique questions...")
-    bm25_q_vecs = bm25_index.vectorizer.transform(unique_questions)
-    bm25_q_idf = bm25_q_vecs.multiply(bm25_index.idf).tocsr()
-
-    print(f"  Batch TF-IDF scoring {len(unique_questions)} unique questions...")
+    print(f"  Encoding {n_unique} unique questions...")
+    bm25_q_idf = bm25_index.vectorizer.transform(unique_questions).multiply(bm25_index.idf).tocsr()
     tfidf_q_vecs = tfidf_index.vectorizer.transform(unique_questions)
 
-    #batch-compute ALL score matrices at once (sparse × sparse, very fast)
-    print("  Computing BM25 score matrix (batch)...")
-    bm25_score_matrix = bm25_q_idf.dot(bm25_index.adjusted_tf.T).tocsr()
-    print("  Computing TF-IDF score matrix (batch)...")
-    tfidf_score_matrix = (tfidf_q_vecs @ tfidf_index.tfidf_matrix.T).tocsr()
-
-    #precompute chunk_id -> index for fast lookup
     bm25_id_to_idx = bm25_index.chunk_id_to_idx
     tfidf_id_to_idx = tfidf_index.chunk_id_to_idx
 
+    #pre-transpose once
+    bm25_adj_T = bm25_index.adjusted_tf.T.tocsc()
+    tfidf_mat_T = tfidf_index.tfidf_matrix.T.tocsc()
+
+    #batched scoring: convert query batch to dense, then dense×sparse → dense result
+    #avoids scipy sparse×sparse nnz over-estimation (which caused 72 GiB OOM)
+    print(f"  Scoring {n_unique} questions in batches of {batch_size}...")
+    q_data: dict[int, tuple] = {}
+
+    for batch_start in range(0, n_unique, batch_size):
+        batch_end = min(batch_start + batch_size, n_unique)
+
+        #dense query batch × sparse doc matrix → dense scores
+        bm25_batch = np.asarray(bm25_q_idf[batch_start:batch_end].toarray() @ bm25_adj_T)
+        tfidf_batch = np.asarray(tfidf_q_vecs[batch_start:batch_end].toarray() @ tfidf_mat_T)
+
+        for local_i in range(batch_end - batch_start):
+            qi = batch_start + local_i
+            bm25_scores = bm25_batch[local_i].ravel()
+            tfidf_scores = tfidf_batch[local_i].ravel()
+
+            bm25_topk_idx = np.argpartition(bm25_scores, -candidate_k)[-candidate_k:]
+            bm25_topk = bm25_topk_idx[np.argsort(bm25_scores[bm25_topk_idx])[::-1]]
+            tfidf_topk_idx = np.argpartition(tfidf_scores, -candidate_k)[-candidate_k:]
+            tfidf_topk = tfidf_topk_idx[np.argsort(tfidf_scores[tfidf_topk_idx])[::-1]]
+
+            seen = set()
+            candidates = []
+            for idx in list(bm25_topk) + list(tfidf_topk):
+                cid = bm25_index.chunk_ids[idx]
+                if cid not in seen:
+                    seen.add(cid)
+                    candidates.append(cid)
+
+            bm25_dict = {cid: float(bm25_scores[bm25_id_to_idx[cid]]) for cid in candidates}
+            tfidf_dict = {cid: float(tfidf_scores[tfidf_id_to_idx[cid]]) for cid in candidates}
+            q_data[qi] = (candidates, bm25_dict, tfidf_dict)
+
+        del bm25_batch, tfidf_batch
+        gc.collect()
+
+        if (batch_start // batch_size) % 10 == 0:
+            print(f"    {batch_end}/{n_unique} questions scored")
+
+    #build feature vectors per QA pair
     precomputed = []
-    for qa in tqdm(qa_list, desc="Preparing candidates"):
+    for qa in tqdm(qa_list, desc="Building features"):
         question = qa['question']
-        golden_ids = set(qa['segment_ids'])
+        golden_ids = set(qa['chunk_ids'])
         qi = q_to_idx[question]
 
-        #look up pre-computed score rows (no per-question matrix ops)
-        bm25_all = bm25_score_matrix[qi].toarray().flatten()
-        tfidf_all = tfidf_score_matrix[qi].toarray().flatten()
+        candidates, bm25_dict, tfidf_dict = q_data[qi]
 
-        #top-k from each
-        bm25_topk = np.argsort(bm25_all)[-candidate_k:][::-1]
-        tfidf_topk = np.argsort(tfidf_all)[-candidate_k:][::-1]
-
-        seen = set()
-        candidates = []
-        for idx in list(bm25_topk) + list(tfidf_topk):
-            cid = bm25_index.chunk_ids[idx]
-            if cid not in seen:
-                seen.add(cid)
-                candidates.append(cid)
-
-        #build feature rows using already-computed scores
         q_tokens = set(question.lower().split())
         q_len = len(question.split())
         rows = []
@@ -141,8 +158,8 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
             overlap_count = len(q_tokens & c_tokens)
 
             rows.append({
-                'bm25_score': float(bm25_all[bm25_id_to_idx[chunk_id]]),
-                'cosine_similarity': float(tfidf_all[tfidf_id_to_idx[chunk_id]]),
+                'bm25_score': bm25_dict[chunk_id],
+                'cosine_similarity': tfidf_dict[chunk_id],
                 'token_overlap_ratio': overlap_count / len(q_tokens) if q_tokens else 0.0,
                 'token_overlap_count': overlap_count,
                 'question_length': q_len,
@@ -157,11 +174,14 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
             if col not in feat_df.columns:
                 feat_df[col] = 0
 
+        bm25_arr = np.array([bm25_dict[cid] for cid in candidates])
+        tfidf_arr = np.array([tfidf_dict[cid] for cid in candidates])
+
         precomputed.append({
             'candidate_ids': candidates,
             'features': feat_df[feature_cols].values,
-            'bm25_scores': feat_df['bm25_score'].values,
-            'tfidf_scores': feat_df['cosine_similarity'].values,
+            'bm25_scores': bm25_arr,
+            'tfidf_scores': tfidf_arr,
             'golden_ids': golden_ids,
             'metadata': {
                 'question': question,
@@ -169,7 +189,7 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
                 'reasoning_type': qa['reasoning_type'],
                 'n_candidates': len(candidates),
                 'n_golden': len(golden_ids),
-                'golden_in_candidates': len(golden_ids & seen),
+                'golden_in_candidates': len(golden_ids & set(candidates)),
             },
         })
 
@@ -177,10 +197,9 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
 
 
 def evaluate_from_candidates(precomputed, model, k_values=[5, 10, 20], show_progress=True):
-    """Score precomputed candidates with a model and compute metrics.
+    """Score candidates with a model and compute ranking metrics.
 
-    model=None -> BM25 baseline, model='tfidf' -> TF-IDF baseline,
-    otherwise uses model.predict_proba or model.predict.
+    model=None -> BM25 baseline, model='tfidf' -> TF-IDF baseline.
     """
     from tqdm.auto import tqdm
 
@@ -192,7 +211,7 @@ def evaluate_from_candidates(precomputed, model, k_values=[5, 10, 20], show_prog
 
     iterator = tqdm(precomputed, desc="Evaluating", disable=not show_progress)
 
-    #batch model predictions across all questions for speed
+    #batch predictions for speed
     batched_scores = None
     if model is not None and model != 'tfidf':
         sizes = [len(e['candidate_ids']) for e in precomputed]
@@ -232,11 +251,7 @@ def evaluate_from_candidates(precomputed, model, k_values=[5, 10, 20], show_prog
 
 
 def candidates_to_training_data(precomputed, feature_cols):
-    """Convert precomputed candidates into X, y, groups for training rankers.
-
-    This ensures training distribution matches evaluation (hard negatives
-    from BM25/TF-IDF top-k, not random corpus chunks).
-    """
+    """Convert precomputed candidates into X, y, groups arrays for ranker training."""
     X_rows = []
     y_rows = []
     groups = []
@@ -262,7 +277,7 @@ def candidates_to_training_data(precomputed, feature_cols):
 def evaluate_full_retrieval(test_qa, bm25_index, tfidf_index, chunk_lookup,
                             model, feature_cols, candidate_k=100,
                             k_values=[5, 10, 20]):
-    """Evaluate against full corpus (convenience wrapper, not for multi-model use)."""
+    """Convenience wrapper: prepare candidates then evaluate."""
     precomputed = prepare_candidates(test_qa, bm25_index, tfidf_index,
                                      chunk_lookup, feature_cols, candidate_k)
     return evaluate_from_candidates(precomputed, model, k_values)
