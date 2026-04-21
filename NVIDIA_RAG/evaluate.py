@@ -217,7 +217,7 @@ def evaluate_from_candidates(precomputed, model, k_values=[5, 10, 20], show_prog
             scores = batched_scores[i]
 
         ranked_idx = np.argsort(-scores)
-        relevances = [1 if candidates[i] in golden_ids else 0 for i in ranked_idx]
+        relevances = [1 if candidates[j] in golden_ids else 0 for j in ranked_idx]
         total_relevant = len(golden_ids)
 
         for k in k_values:
@@ -229,6 +229,34 @@ def evaluate_from_candidates(precomputed, model, k_values=[5, 10, 20], show_prog
 
     metrics = {m: np.mean(v) for m, v in results.items()}
     return metrics, pd.DataFrame(meta_rows)
+
+
+def candidates_to_training_data(precomputed, feature_cols):
+    """Convert precomputed candidates into X, y, groups for training rankers.
+
+    This ensures training distribution matches evaluation (hard negatives
+    from BM25/TF-IDF top-k, not random corpus chunks).
+    """
+    X_rows = []
+    y_rows = []
+    groups = []
+
+    for entry in precomputed:
+        candidates = entry['candidate_ids']
+        golden_ids = entry['golden_ids']
+        features = entry['features']
+
+        labels = np.array([1 if cid in golden_ids else 0 for cid in candidates])
+
+        X_rows.append(features)
+        y_rows.append(labels)
+        groups.append(len(candidates))
+
+    X = np.vstack(X_rows)
+    y = np.concatenate(y_rows)
+    groups = np.array(groups)
+
+    return X, y, groups
 
 
 def evaluate_full_retrieval(test_qa, bm25_index, tfidf_index, chunk_lookup,
