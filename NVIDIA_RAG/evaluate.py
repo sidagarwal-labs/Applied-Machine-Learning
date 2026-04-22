@@ -75,11 +75,17 @@ def evaluate_ranking(df, score_col, k_values=[5, 10, 20]):
 
 
 def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
-                       feature_cols, candidate_k=100, batch_size=500):
+                       feature_cols, candidate_k=100, batch_size=500,
+                       inject_golden=False):
     """Retrieve BM25∪TF-IDF top-k candidates and compute features per question.
 
     Returns list of dicts with candidate_ids, features, golden_ids, metadata.
     Uses dense×sparse batched matmul to avoid scipy OOM and per-question overhead.
+
+    If inject_golden=True, golden chunks missing from the retrieval pool are
+    appended to the candidate list (with their actual BM25/TF-IDF scores).
+    This ensures every training question has at least one positive label.
+    Only use inject_golden=True for training data — never for evaluation.
     """
     from tqdm import tqdm
     import gc
@@ -88,6 +94,15 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
     unique_questions = list(dict.fromkeys(questions))
     q_to_idx = {q: i for i, q in enumerate(unique_questions)}
     n_unique = len(unique_questions)
+
+    # pre-collect golden chunk_ids per unique question for injection
+    golden_by_qi = {}
+    if inject_golden:
+        for qa in qa_list:
+            qi = q_to_idx[qa['question']]
+            if qi not in golden_by_qi:
+                golden_by_qi[qi] = set()
+            golden_by_qi[qi].update(qa['chunk_ids'])
 
     print(f"  Encoding {n_unique} unique questions...")
     bm25_q_idf = bm25_index.vectorizer.transform(unique_questions).multiply(bm25_index.idf).tocsr()
@@ -130,6 +145,13 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
                     seen.add(cid)
                     candidates.append(cid)
 
+            # inject missing golden chunks so the model always has positives
+            if inject_golden and qi in golden_by_qi:
+                for gid in golden_by_qi[qi]:
+                    if gid not in seen and gid in bm25_id_to_idx:
+                        seen.add(gid)
+                        candidates.append(gid)
+
             bm25_dict = {cid: float(bm25_scores[bm25_id_to_idx[cid]]) for cid in candidates}
             tfidf_dict = {cid: float(tfidf_scores[tfidf_id_to_idx[cid]]) for cid in candidates}
             q_data[qi] = (candidates, bm25_dict, tfidf_dict)
@@ -149,6 +171,12 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
 
         candidates, bm25_dict, tfidf_dict = q_data[qi]
 
+        # compute rank features (1-based, lower = better)
+        bm25_sorted = sorted(candidates, key=lambda cid: bm25_dict[cid], reverse=True)
+        tfidf_sorted = sorted(candidates, key=lambda cid: tfidf_dict[cid], reverse=True)
+        bm25_rank_map = {cid: rank + 1 for rank, cid in enumerate(bm25_sorted)}
+        tfidf_rank_map = {cid: rank + 1 for rank, cid in enumerate(tfidf_sorted)}
+
         q_tokens = set(question.lower().split())
         q_len = len(question.split())
         rows = []
@@ -156,6 +184,8 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
             chunk = chunk_lookup[chunk_id]
             c_tokens = set(chunk['chunk_text'].lower().split())
             overlap_count = len(q_tokens & c_tokens)
+            b_rank = bm25_rank_map[chunk_id]
+            t_rank = tfidf_rank_map[chunk_id]
 
             rows.append({
                 'bm25_score': bm25_dict[chunk_id],
@@ -167,6 +197,10 @@ def prepare_candidates(qa_list, bm25_index, tfidf_index, chunk_lookup,
                 'chunk_sentence_count': chunk['sentence_count'],
                 'question_complexity': qa['question_complexity'],
                 'hop_count': qa['hop_count'],
+                'bm25_rank': b_rank,
+                'tfidf_rank': t_rank,
+                'bm25_reciprocal_rank': 1.0 / b_rank,
+                'rank_diff': b_rank - t_rank,
             })
 
         feat_df = pd.DataFrame(rows)
